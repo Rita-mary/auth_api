@@ -1,16 +1,25 @@
+use actix_web::{HttpMessage, HttpRequest ,  Error};
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use futures::stream::StreamExt;
 use mongodb::bson::doc;
 use mongodb::Database;
+use mongodb::Collection;
 use serde::{Deserialize, Serialize};
 use argon2::{self, Config as ArgonConfig};
 use uuid::Uuid;
 use jsonwebtoken::{encode, Header, EncodingKey};
 use std::env;
-use rand::Rng; // Added to resolve `.gen()` method error
+use rand::Rng; 
 
 mod db;
 mod models;
 mod middleware;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Counter{
+    _id: String,
+    sequence: i64,
+}
 
 // Struct for sign-up input
 #[derive(Debug,Deserialize)]
@@ -19,6 +28,7 @@ struct SignupInput {
     email: String,
     password: String,
 }
+
 
 // Struct for login input
 #[derive(Deserialize)]
@@ -40,6 +50,134 @@ struct AuthResponse {
     token: String,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct Todo{
+    #[serde(rename = "_id")]
+    id : i64,
+    user_id : String,
+    title: String,
+    description : String,
+    completed: bool,
+}
+
+async fn create_todo(db: web::Data<Collection<Todo>>, 
+    todo : web::Json<Todo> , 
+    req:HttpRequest  , 
+    counter_db : web::Data<Collection<Counter>>) -> Result<HttpResponse , Error>{
+        let next_id = get_next_id(&counter_db , "todo_id").await.map_err(actix_web::error::ErrorInternalServerError)?;
+        let c_user_id = req.extensions().get::<String>().cloned();
+
+        if let Some(user_id_g) =c_user_id{
+            let new_todo = Todo{
+                id: next_id,
+                user_id: user_id_g,
+                title: todo.title.clone(),
+                description: todo.description.clone(),
+                completed: todo.completed,
+            };
+            db.insert_one(new_todo, None).await.map_err(actix_web::error::ErrorInternalServerError)?;
+            Ok(HttpResponse::Created().json("Todo created successfully"))
+        
+        }
+        else {
+            Ok(HttpResponse::Unauthorized().body("Unauthorized , login first"))
+        }
+
+    }
+
+async fn update_todo(db: web::Data<Collection<Todo>> ,
+     req: HttpRequest,
+     todo_id: web::Path<i64> ,
+     new_value: web::Json<Todo>) -> Result <HttpResponse , Error>{
+
+        let c_user_id = req.extensions().get::<String>().cloned();
+        if let Some(user_id_g) = c_user_id{
+            let filter = doc!{"_id": *todo_id , "user_id": user_id_g};
+
+            if new_value.id != 0{
+                Ok(HttpResponse::BadRequest().body("You cannot update the id of an existing todo."))
+            }
+            else{
+                let new_todo = doc!{
+                    "$set": {
+                        "title": new_value.title.clone(),
+                        "description": new_value.description.clone(),
+                        "completed": new_value.completed,
+                    }
+                };
+                let result = db.update_one(filter, new_todo , None).await.map_err(actix_web::error::ErrorInternalServerError)?;
+                if result.modified_count == 1 {
+                    Ok(HttpResponse::Ok().json("Todo updated successfully"))
+                } else {
+                    Ok(HttpResponse::NotFound().body("Todo not found"))
+                }
+
+            }
+
+        }
+        else {
+            Ok(HttpResponse::Unauthorized().body("Unauthorized"))
+        }
+
+}
+
+async fn get_next_id(db: &Collection<Counter> , seq_name: &str) -> Result<i64 , mongodb::error::Error>{
+
+    let filter = doc!{"_id": seq_name};
+    let update = doc!{"$inc":{seq_name: 1}};
+
+    let options = mongodb::options::FindOneAndUpdateOptions::builder()
+    .upsert(true).return_document(mongodb::options::ReturnDocument::After)
+    .build();
+
+    let result = db.find_one_and_update(filter , update , options).await?;
+    
+    if let Some(counter) = result{
+        Ok(counter.sequence)
+    }
+    else {
+        Err(mongodb::error::Error::custom("Failed to generate sequence value"))
+    }
+
+
+}
+
+async fn get_todos(
+    db: web::Data<Collection<Todo>>,
+    req: HttpRequest
+) -> Result<HttpResponse, Error> {
+    let filter = doc!{"user_id": req.extensions().get::<String>().cloned()};
+    let mut cursor = db.find(filter , None).await.map_err(actix_web::error::ErrorInternalServerError)?;
+    let mut todos = vec![];
+    while let Some(result) = cursor.next().await{
+        match result {
+            Ok(todo) => todos.push(todo),
+            Err(e) => {
+                eprintln!("Error fetching todo: {}", e);
+                return Err(actix_web::error::ErrorInternalServerError("Failed to fetch todo"));
+            }
+        }
+    }
+    Ok(HttpResponse::Ok().json(todos))
+}
+
+async fn delete_todo(db: web::Data<Collection<Todo>> ,
+    req: HttpRequest,
+    todo_id: web::Path<i64>)->Result<HttpResponse , Error>{
+        let c_user_id = req.extensions().get::<String>().cloned();
+        if let Some(user_id_g) = c_user_id{
+            let filter = doc!{"_id": *todo_id , "user_id": user_id_g};
+            let result = db.delete_one(filter , None).await.map_err(actix_web::error::ErrorInternalServerError)?;
+            if result.deleted_count == 1 {
+                Ok(HttpResponse::Ok().json("Todo deleted successfully"))
+            } else {
+                Ok(HttpResponse::NotFound().body("Todo not found"))
+            }
+        }
+        else{
+            Ok(HttpResponse::Unauthorized().body("Unauthorized"))
+        }
+    }
 // Handler for user sign-up
 async fn sign_up(db: web::Data<Database>, input: web::Json<SignupInput>) -> impl Responder {
     println!("Received signup request: {:?}", input);
@@ -243,6 +381,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/profile/{email}", web::get().to(get_profile))
                     .route("/profile/{email}", web::put().to(update_profile))
                     .route("/delete/{email}", web::delete().to(delete_user))
+                    .route("/create_todo", web::post().to(create_todo))
+                    .route("/update_todo", web::put().to(update_todo))
+                    .route("/todos" , web::get().to(get_todos))
+                    .route("/delete_todo/{id}", web::delete().to(delete_todo))
             )
     })
     .bind("127.0.0.1:8080")? // Bind the server to localhost on port 8080

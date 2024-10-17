@@ -8,3 +8,15 @@ pub struct User {
     pub email: String,       // User's email (used for login)
     pub password: String,    // Hashed password
 }
+
+#[derive(Debug , Deserialize , Serialize, Clone)]
+struct Events{
+    title: String,
+    body: String,
+}
+
+#[derive(Debug , Deserialize , Serialize, Clone)]
+struct AddEvent{
+    title: String,
+    body: String,
+}

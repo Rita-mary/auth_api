@@ -83,7 +83,7 @@ where
                         ) {
                             Ok(token_data) => {
                                 // Token is valid; proceed to the next service
-                                req.extensions_mut().insert(token_data.claims);
+                                req.extensions_mut().insert(token_data.claims.sub);
                                 service.call(req).await
                             },
                             Err(_) => {
